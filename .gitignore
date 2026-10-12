@@ -1,0 +1,28 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Model weights & Hugging Face Cache
+checkpoints/
+hf_cache/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+
+# Benchmark outputs
+*.csv
+*.log
+!figures/.gitkeep

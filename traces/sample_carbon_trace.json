@@ -1,0 +1,8 @@
+[
+  {"timestamp": "2026-10-12T00:00:00Z", "carbon_intensity_gco2_kwh": 412.5, "grid_signal": "HIGH_CARBON"},
+  {"timestamp": "2026-10-12T04:00:00Z", "carbon_intensity_gco2_kwh": 380.0, "grid_signal": "MODERATE"},
+  {"timestamp": "2026-10-12T08:00:00Z", "carbon_intensity_gco2_kwh": 290.2, "grid_signal": "LOW_CARBON"},
+  {"timestamp": "2026-10-12T12:00:00Z", "carbon_intensity_gco2_kwh": 145.0, "grid_signal": "SOLAR_SURGE_GREEN"},
+  {"timestamp": "2026-10-12T16:00:00Z", "carbon_intensity_gco2_kwh": 310.8, "grid_signal": "MODERATE"},
+  {"timestamp": "2026-10-12T20:00:00Z", "carbon_intensity_gco2_kwh": 465.3, "grid_signal": "PEAK_CARBON"}
+]

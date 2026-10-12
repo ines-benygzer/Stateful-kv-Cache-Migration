@@ -1,0 +1,20 @@
+{
+  "5g_edge_uplink": {
+    "description": "Telekom 5G Private Edge Uplink",
+    "bandwidth_mbps": 50.0,
+    "rtt_ms": 25.0,
+    "jitter_ms": 5.0
+  },
+  "constrained_edge_wan": {
+    "description": "Remote Fog / IoT Gateway to Central Cloud",
+    "bandwidth_mbps": 15.0,
+    "rtt_ms": 65.0,
+    "jitter_ms": 15.0
+  },
+  "datacenter_interconnect": {
+    "description": "Metro Datacenter Direct Fiber",
+    "bandwidth_mbps": 1000.0,
+    "rtt_ms": 2.0,
+    "jitter_ms": 0.5
+  }
+}
