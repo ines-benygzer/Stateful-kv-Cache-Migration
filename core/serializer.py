@@ -1,1 +1,332 @@
-# KV-cache serialization & adaptive compression
+"""KV-Cache Serializer & Adaptive Quantizer.
+
+Supports:
+1. 'fp16': Serializes cache tensors in half-precision floating point.
+2. 'int8': Dynamically quantizes each cache tensor to signed 8-bit integers using
+   an affine scale and zero-point with safe constant-value handling.
+Preserves token IDs, sequence metadata, and cache structures without quantizing integers.
+"""
+
+from typing import Dict, Any, Optional, Tuple, List, Union
+import io
+import time
+import torch
+
+try:
+    from transformers.cache_utils import DynamicCache
+except ImportError:
+    DynamicCache = None
+
+
+def quantize_tensor_int8(tensor: torch.Tensor) -> Dict[str, Any]:
+    """Quantize a floating-point tensor to signed INT8 using affine quantization."""
+    orig_dtype = tensor.dtype
+    t_f = tensor.detach().to(torch.float32)
+
+    t_min = t_f.min().item()
+    t_max = t_f.max().item()
+
+    # Handle constant-valued tensors separately.
+    if t_max - t_min < 1e-7:
+        return {
+            "quantized": torch.zeros(tensor.shape, dtype=torch.int8),
+            "scale": 0.0,
+            "zero_point": 0,
+            "const_val": t_min,
+            "orig_dtype": orig_dtype,
+            "shape": tuple(tensor.shape),
+        }
+
+    # Include zero in the range so the zero point remains valid.
+    q_min, q_max = -128, 127
+    min_val = min(t_min, 0.0)
+    max_val = max(t_max, 0.0)
+
+    scale = (max_val - min_val) / (q_max - q_min)
+    zero_point = round(q_min - min_val / scale)
+    zero_point = max(q_min, min(q_max, zero_point))
+
+    q = torch.clamp(
+        torch.round(t_f / scale) + zero_point,
+        q_min,
+        q_max,
+    ).to(torch.int8)
+
+    return {
+        "quantized": q,
+        "scale": scale,
+        "zero_point": zero_point,
+        "const_val": 0.0,
+        "orig_dtype": orig_dtype,
+        "shape": tuple(tensor.shape),
+    }
+
+def dequantize_tensor_int8(meta: Dict[str, Any], target_device: Optional[str] = None) -> torch.Tensor:
+    """Restores an INT8 quantized tensor representation to its original floating-point dtype.
+
+    Args:
+        meta: Dictionary produced by `quantize_tensor_int8`.
+        target_device: Device to place the restored tensor on.
+
+    Returns:
+        Restored PyTorch tensor.
+    """
+    orig_dtype = meta["orig_dtype"]
+    shape = meta["shape"]
+
+    if meta["scale"] == 0.0:
+        res = torch.full(shape, meta["const_val"], dtype=orig_dtype)
+        return res.to(target_device) if target_device else res
+
+    q = meta["quantized"].to(torch.float32)
+    restored = (q - meta["zero_point"]) * meta["scale"]
+    res = restored.to(orig_dtype)
+    return res.to(target_device) if target_device else res
+
+
+def _extract_cpu_kv_layers(past_key_values: Any) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Normalizes heterogeneous cache structures into a list of CPU (key, value) pairs."""
+    cpu_kv: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    if hasattr(past_key_values, "layers"):  # Transformers v5+ DynamicCache
+        for layer in past_key_values.layers:
+            cpu_kv.append((layer.keys.detach().to("cpu"), layer.values.detach().to("cpu")))
+    elif hasattr(past_key_values, "key_cache"):  # Transformers v4 DynamicCache
+        for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
+            cpu_kv.append((k.detach().to("cpu"), v.detach().to("cpu")))
+    elif isinstance(past_key_values, (tuple, list)):
+        for layer_k, layer_v in past_key_values:
+            cpu_kv.append((layer_k.detach().to("cpu"), layer_v.detach().to("cpu")))
+    else:
+        raise TypeError(f"Unsupported cache structure: {type(past_key_values)}")
+    return cpu_kv
+
+
+class KVCacheSerializer:
+    """Serializer and Quantizer for LLM Key-Value Caches and Handover States."""
+
+    @staticmethod
+    def serialize_cache(
+        past_key_values: Any,
+        mode: str = "fp16",
+    ) -> Tuple[bytes, Dict[str, Any]]:
+        """Serializes raw KV-cache tensors into bytes with timing and size metrics.
+
+        Args:
+            past_key_values: Cache structure (DynamicCache or tuple of tuples).
+            mode: 'fp16' or 'int8'.
+
+        Returns:
+            Tuple of (serialized_bytes, metrics_dict).
+        """
+        if mode not in ("fp16", "int8"):
+            raise ValueError(f"Invalid mode '{mode}'. Choose 'fp16' or 'int8'.")
+
+        t0 = time.perf_counter()
+        cpu_kv = _extract_cpu_kv_layers(past_key_values)
+        num_layers = len(cpu_kv)
+        seq_len = cpu_kv[0][0].shape[-2] if num_layers > 0 else 0
+
+        raw_tensor_bytes = 0
+        packed_layers = []
+        max_abs_error = 0.0
+        total_abs_error_sum = 0.0
+        total_elements = 0
+
+        for layer_idx, (layer_k, layer_v) in enumerate(cpu_kv):
+            if mode == "fp16":
+                k_fp16 = layer_k.to(torch.float16)
+                v_fp16 = layer_v.to(torch.float16)
+                raw_tensor_bytes += (k_fp16.numel() + v_fp16.numel()) * 2
+                packed_layers.append({
+                    "k": k_fp16,
+                    "v": v_fp16,
+                    "orig_k_dtype": layer_k.dtype,
+                    "orig_v_dtype": layer_v.dtype,
+                })
+                # FP16 rounding error metric
+                err_k = (k_fp16.to(layer_k.dtype) - layer_k).abs()
+                err_v = (v_fp16.to(layer_v.dtype) - layer_v).abs()
+                max_abs_error = max(max_abs_error, err_k.max().item(), err_v.max().item())
+                total_abs_error_sum += err_k.sum().item() + err_v.sum().item()
+                total_elements += err_k.numel() + err_v.numel()
+
+            elif mode == "int8":
+                meta_k = quantize_tensor_int8(layer_k)
+                meta_v = quantize_tensor_int8(layer_v)
+                raw_tensor_bytes += meta_k["quantized"].numel() + meta_v["quantized"].numel()
+                packed_layers.append({"k_meta": meta_k, "v_meta": meta_v})
+
+                # Compute reconstruction error
+                k_recon = dequantize_tensor_int8(meta_k)
+                v_recon = dequantize_tensor_int8(meta_v)
+                err_k = (k_recon - layer_k).abs()
+                err_v = (v_recon - layer_v).abs()
+                max_abs_error = max(max_abs_error, err_k.max().item(), err_v.max().item())
+                total_abs_error_sum += err_k.sum().item() + err_v.sum().item()
+                total_elements += err_k.numel() + err_v.numel()
+
+        payload_dict = {
+            "mode": mode,
+            "num_layers": num_layers,
+            "seq_len": seq_len,
+            "layers": packed_layers,
+        }
+
+        buffer = io.BytesIO()
+        torch.save(payload_dict, buffer)
+        payload = buffer.getvalue()
+        serialization_time_ms = (time.perf_counter() - t0) * 1000.0
+
+        total_bytes = len(payload)
+        metadata_overhead_bytes = max(0, total_bytes - raw_tensor_bytes)
+
+        metrics = {
+            "mode": mode,
+            "num_layers": num_layers,
+            "seq_len": seq_len,
+            "payload_bytes": total_bytes,
+            "payload_mb": total_bytes / 1_000_000.0,
+            "raw_tensor_bytes": raw_tensor_bytes,
+            "raw_tensor_mb": raw_tensor_bytes / 1_000_000.0,
+            "metadata_overhead_bytes": metadata_overhead_bytes,
+            "metadata_overhead_pct": (metadata_overhead_bytes / total_bytes * 100.0) if total_bytes > 0 else 0.0,
+            "serialization_time_ms": serialization_time_ms,
+            "max_abs_error": max_abs_error,
+            "mean_abs_error": (total_abs_error_sum / total_elements) if total_elements > 0 else 0.0,
+        }
+
+        return payload, metrics
+
+    @staticmethod
+    def deserialize_cache(
+        payload: bytes,
+        target_device: Optional[str] = None,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Deserializes bytes into a restored KV-cache structure.
+
+        Args:
+            payload: Serialized bytes.
+            target_device: Target PyTorch device ('cpu', 'mps', 'cuda').
+
+        Returns:
+            Tuple of (restored_kv_cache, stats_dict).
+        """
+        t0 = time.perf_counter()
+        buffer = io.BytesIO(payload)
+        payload_dict = torch.load(buffer, weights_only=True)
+
+        mode = payload_dict["mode"]
+        num_layers = payload_dict["num_layers"]
+        seq_len = payload_dict["seq_len"]
+        layers = payload_dict["layers"]
+
+        device_kv: List[Tuple[torch.Tensor, torch.Tensor]] = []
+
+        for layer in layers:
+            if mode == "fp16":
+                k = layer["k"].to(layer.get("orig_k_dtype", torch.float32))
+                v = layer["v"].to(layer.get("orig_v_dtype", torch.float32))
+                device_kv.append((
+                    k.to(target_device) if target_device else k,
+                    v.to(target_device) if target_device else v,
+                ))
+            elif mode == "int8":
+                k = dequantize_tensor_int8(layer["k_meta"], target_device=target_device)
+                v = dequantize_tensor_int8(layer["v_meta"], target_device=target_device)
+                device_kv.append((k, v))
+
+        # Reconstruct into DynamicCache if available
+        if DynamicCache is not None:
+            restored_cache = DynamicCache()
+            for i, (k, v) in enumerate(device_kv):
+                restored_cache.update(k, v, i)
+        else:
+            restored_cache = tuple(device_kv)
+
+        deserialization_time_ms = (time.perf_counter() - t0) * 1000.0
+
+        stats = {
+            "mode": mode,
+            "num_layers": num_layers,
+            "seq_len": seq_len,
+            "deserialization_time_ms": deserialization_time_ms,
+        }
+
+        return restored_cache, stats
+
+    @classmethod
+    def serialize_handover_state(
+        cls,
+        state_dict: Dict[str, Any],
+        mode: str = "fp16",
+    ) -> Tuple[bytes, Dict[str, Any]]:
+        """Serializes the complete handover state (tokens, metadata, and quantized KV cache).
+
+        Ensures token IDs, model name, and metadata remain unquantized.
+        """
+        if mode not in ("fp16", "int8"):
+            raise ValueError(f"Invalid mode '{mode}'. Choose 'fp16' or 'int8'.")
+
+        t0 = time.perf_counter()
+        kv_payload, kv_metrics = cls.serialize_cache(state_dict["kv_cache"], mode=mode)
+
+        combined_dict = {
+            "model_name": state_dict.get("model_name"),
+            "cached_token_ids": state_dict["cached_token_ids"].detach().to("cpu"),
+            "pending_token_id": state_dict["pending_token_id"].detach().to("cpu"),
+            "generated_token_ids": state_dict.get("generated_token_ids", []),
+            "kv_payload": kv_payload,
+            "mode": mode,
+            "num_layers": state_dict.get("num_layers", kv_metrics["num_layers"]),
+            "kv_seq_len": state_dict.get("kv_seq_len", kv_metrics["seq_len"]),
+        }
+
+        buffer = io.BytesIO()
+        torch.save(combined_dict, buffer)
+        total_payload = buffer.getvalue()
+        total_time_ms = (time.perf_counter() - t0) * 1000.0
+
+        metrics = dict(kv_metrics)
+        metrics["total_state_bytes"] = len(total_payload)
+        metrics["total_state_mb"] = len(total_payload) / 1_000_000.0
+        metrics["total_serialization_time_ms"] = total_time_ms
+
+        return total_payload, metrics
+
+    @classmethod
+    def deserialize_handover_state(
+        cls,
+        payload: bytes,
+        target_device: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Deserializes a complete handover state payload into the exact structure required by `worker.import_state`.
+        """
+        t0 = time.perf_counter()
+        buffer = io.BytesIO(payload)
+        combined_dict = torch.load(buffer, weights_only=True)
+
+        mode = combined_dict["mode"]
+        kv_payload = combined_dict["kv_payload"]
+        restored_kv, kv_stats = cls.deserialize_cache(kv_payload, target_device=target_device)
+
+        # Convert back to legacy CPU tuple for compatibility with worker.import_state
+        cpu_kv = _extract_cpu_kv_layers(restored_kv)
+
+        state_dict = {
+            "model_name": combined_dict.get("model_name"),
+            "cached_token_ids": combined_dict["cached_token_ids"],
+            "pending_token_id": combined_dict["pending_token_id"],
+            "generated_token_ids": combined_dict.get("generated_token_ids", []),
+            "kv_cache": tuple(cpu_kv),
+            "num_layers": len(cpu_kv),
+            "kv_seq_len": combined_dict["kv_seq_len"],
+        }
+
+        total_deserialization_time_ms = (time.perf_counter() - t0) * 1000.0
+        stats = {
+            "mode": mode,
+            "total_deserialization_time_ms": total_deserialization_time_ms,
+            "kv_deserialization_time_ms": kv_stats["deserialization_time_ms"],
+        }
+
+        return state_dict, stats
