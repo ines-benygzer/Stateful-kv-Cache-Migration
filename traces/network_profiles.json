@@ -8,7 +8,7 @@
   "constrained_edge_wan": {
     "description": "Remote Fog / IoT Gateway to Central Cloud",
     "bandwidth_mbps": 15.0,
-    "rtt_ms": 65.0,
+    "rtt_ms": 60.0,
     "jitter_ms": 15.0
   },
   "datacenter_interconnect": {
