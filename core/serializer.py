@@ -108,12 +108,16 @@ class KVCacheSerializer:
     def serialize_cache(
         past_key_values: Any,
         mode: str = "fp16",
+        compute_error_metrics: bool = False,
     ) -> Tuple[bytes, Dict[str, Any]]:
         """Serializes raw KV-cache tensors into bytes with timing and size metrics.
 
         Args:
             past_key_values: Cache structure (DynamicCache or tuple of tuples).
             mode: 'fp16' or 'int8'.
+            compute_error_metrics: If True, computes numerical reconstruction error
+                (max and mean absolute error). Kept False during benchmarks to measure
+                pure serialization timing without diagnostic overhead.
 
         Returns:
             Tuple of (serialized_bytes, metrics_dict).
@@ -143,12 +147,12 @@ class KVCacheSerializer:
                     "orig_k_dtype": layer_k.dtype,
                     "orig_v_dtype": layer_v.dtype,
                 })
-                # FP16 rounding error metric
-                err_k = (k_fp16.to(layer_k.dtype) - layer_k).abs()
-                err_v = (v_fp16.to(layer_v.dtype) - layer_v).abs()
-                max_abs_error = max(max_abs_error, err_k.max().item(), err_v.max().item())
-                total_abs_error_sum += err_k.sum().item() + err_v.sum().item()
-                total_elements += err_k.numel() + err_v.numel()
+                if compute_error_metrics:
+                    err_k = (k_fp16.to(layer_k.dtype) - layer_k).abs()
+                    err_v = (v_fp16.to(layer_v.dtype) - layer_v).abs()
+                    max_abs_error = max(max_abs_error, err_k.max().item(), err_v.max().item())
+                    total_abs_error_sum += err_k.sum().item() + err_v.sum().item()
+                    total_elements += err_k.numel() + err_v.numel()
 
             elif mode == "int8":
                 meta_k = quantize_tensor_int8(layer_k)
@@ -156,14 +160,14 @@ class KVCacheSerializer:
                 raw_tensor_bytes += meta_k["quantized"].numel() + meta_v["quantized"].numel()
                 packed_layers.append({"k_meta": meta_k, "v_meta": meta_v})
 
-                # Compute reconstruction error
-                k_recon = dequantize_tensor_int8(meta_k)
-                v_recon = dequantize_tensor_int8(meta_v)
-                err_k = (k_recon - layer_k).abs()
-                err_v = (v_recon - layer_v).abs()
-                max_abs_error = max(max_abs_error, err_k.max().item(), err_v.max().item())
-                total_abs_error_sum += err_k.sum().item() + err_v.sum().item()
-                total_elements += err_k.numel() + err_v.numel()
+                if compute_error_metrics:
+                    k_recon = dequantize_tensor_int8(meta_k)
+                    v_recon = dequantize_tensor_int8(meta_v)
+                    err_k = (k_recon - layer_k).abs()
+                    err_v = (v_recon - layer_v).abs()
+                    max_abs_error = max(max_abs_error, err_k.max().item(), err_v.max().item())
+                    total_abs_error_sum += err_k.sum().item() + err_v.sum().item()
+                    total_elements += err_k.numel() + err_v.numel()
 
         payload_dict = {
             "mode": mode,
@@ -259,6 +263,7 @@ class KVCacheSerializer:
         cls,
         state_dict: Dict[str, Any],
         mode: str = "fp16",
+        compute_error_metrics: bool = False,
     ) -> Tuple[bytes, Dict[str, Any]]:
         """Serializes the complete handover state (tokens, metadata, and quantized KV cache).
 
@@ -268,7 +273,11 @@ class KVCacheSerializer:
             raise ValueError(f"Invalid mode '{mode}'. Choose 'fp16' or 'int8'.")
 
         t0 = time.perf_counter()
-        kv_payload, kv_metrics = cls.serialize_cache(state_dict["kv_cache"], mode=mode)
+        kv_payload, kv_metrics = cls.serialize_cache(
+            state_dict["kv_cache"],
+            mode=mode,
+            compute_error_metrics=compute_error_metrics,
+        )
 
         combined_dict = {
             "model_name": state_dict.get("model_name"),
