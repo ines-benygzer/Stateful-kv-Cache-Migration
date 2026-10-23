@@ -397,7 +397,14 @@ def run_crossover_benchmark(
     ax2.grid(True, linestyle='--', alpha=0.55)
     ax2.legend(fontsize=9.5, loc='upper left')
 
-    plt.tight_layout()
+    fig.text(
+        0.5, 0.005,
+        "Corrections: INT8 quantization range includes zero; crossover analysis checks all tested lengths and transition directions. "
+        + ("Network jitter enabled (simulated)." if "jitter" in output_path.lower() else "Network jitter disabled (fixed profiles).")
+        + " Network delay is simulated; compute/serialization timings are measured locally. IQR shows trial spread.",
+        ha="center", va="bottom", fontsize=7, wrap=True
+    )
+    plt.tight_layout(rect=[0, 0.07, 1, 1])
     plt.savefig(output_path, dpi=300)
     plt.close()
     print(f">> Successfully regenerated figure: {output_path}")
