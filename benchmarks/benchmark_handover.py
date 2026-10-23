@@ -267,33 +267,71 @@ def run_crossover_benchmark(
     print("MEASURED CROSSOVER INTERVAL ANALYSIS (Tested Intervals: [128, 256], [256, 512], [512, 1024], [1024, 2048])")
     print("=" * 115)
 
+  
     def find_crossover_interval(metric_name: str, label: str):
-        crossover_found = False
-        for i in range(len(aggregated_results) - 1):
-            r1 = aggregated_results[i]
-            r2 = aggregated_results[i + 1]
-            diff1 = r1["cold_ttfrt"]["median"] - r1[metric_name]["median"]
-            diff2 = r2["cold_ttfrt"]["median"] - r2[metric_name]["median"]
+        # Positive difference means migration is faster than cold re-prefill.
+        diffs = [
+            r["cold_ttfrt"]["median"] - r[metric_name]["median"]
+            for r in aggregated_results
+        ]
 
-            # If difference sign changes from negative (cold faster) to positive (migration faster)
-            if diff1 <= 0 and diff2 > 0:
+        seq_lens = [r["seq_len"] for r in aggregated_results]
+
+        if all(d > 0 for d in diffs):
+            print(
+                f">> {label} is faster at every tested sequence length "
+                f"[{seq_lens[0]}, {seq_lens[-1]}] tokens.\n"
+            )
+            return
+
+        if all(d < 0 for d in diffs):
+            print(
+                f">> {label} is slower at every tested sequence length "
+                f"[{seq_lens[0]}, {seq_lens[-1]}] tokens.\n"
+            )
+            return
+
+        if all(d == 0 for d in diffs):
+            print(
+                f">> {label} ties Cold Re-prefill at every tested sequence length.\n"
+            )
+            return
+
+        # Report every adjacent interval where the relative performance changes.
+        found_transition = False
+
+        for i in range(len(diffs) - 1):
+            d1, d2 = diffs[i], diffs[i + 1]
+
+            if d1 * d2 < 0:
+                before = "faster" if d1 > 0 else "slower"
+                after = "faster" if d2 > 0 else "slower"
+
                 print(
-                    f">> {label} crossover relative to Cold Re-prefill is observed in the interval [{r1['seq_len']}, {r2['seq_len']}] tokens:\n"
-                    f"   - At {r1['seq_len']} tokens: Cold Re-prefill ({r1['cold_ttfrt']['median']:.1f} ms) is faster than {label} ({r1[metric_name]['median']:.1f} ms).\n"
-                    f"   - At {r2['seq_len']} tokens: {label} ({r2[metric_name]['median']:.1f} ms) outperforms Cold Re-prefill ({r2['cold_ttfrt']['median']:.1f} ms).\n"
-                    f"   (Exact crossover boundary requires additional targeted measurements within this interval).\n"
+                    f">> {label} changes from {before} to {after} relative "
+                    f"to Cold Re-prefill between {seq_lens[i]} and "
+                    f"{seq_lens[i + 1]} tokens.\n"
+                    f"   Cold-minus-migration differences: "
+                    f"{d1:.1f} ms -> {d2:.1f} ms.\n"
+                    f"   More measurements are needed to locate the crossover.\n"
                 )
-                crossover_found = True
-                break
-        if not crossover_found:
-            first_r = aggregated_results[0]
-            if first_r["cold_ttfrt"]["median"] > first_r[metric_name]["median"]:
+                found_transition = True
+
+            elif d1 == 0 or d2 == 0:
+                idx = i if d1 == 0 else i + 1
                 print(
-                    f">> {label} outperforms Cold Re-prefill across all tested intervals [128, 2048] tokens "
-                    f"(starts at {first_r['seq_len']} tokens: {first_r[metric_name]['median']:.1f} ms vs cold {first_r['cold_ttfrt']['median']:.1f} ms).\n"
+                    f">> {label} ties Cold Re-prefill at "
+                    f"{seq_lens[idx]} tokens.\n"
                 )
-            else:
-                print(f">> {label} did not cross below Cold Re-prefill within the tested intervals.\n")
+                found_transition = True
+
+        if not found_transition:
+            print(
+                f">> {label} has mixed results across tested lengths, "
+                "but no strict adjacent sign change was detected. "
+                "Inspect the medians for ties or non-monotonic behavior.\n"
+            )
+
 
     find_crossover_interval("est_5g_fp16", "5G Edge Uplink (FP16 Raw)")
     find_crossover_interval("est_5g_int8", "5G Edge Uplink (ContinuumKV INT8)")
